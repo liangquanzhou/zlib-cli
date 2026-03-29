@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Z-Library CLI - search and download ebooks from the terminal"
 requires-python = ">=3.10"
 license = "MIT"
-authors = [{ name = "Liangquan Zhou", email = "jluzlq@163.com" }]
+authors = [{ name = "Liangquan Zhou", email = "liangquanzhou@gmail.com" }]
 readme = "README.md"
 keywords = ["zlibrary", "ebooks", "cli", "download"]
 classifiers = [
