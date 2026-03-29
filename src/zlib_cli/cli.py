@@ -1,6 +1,12 @@
-"""Z-Library CLI entry point."""
+"""Z-Library CLI entry point.
+
+Designed for both human and AI agent use. Pass --json to any command
+for machine-readable JSON output on stdout.
+"""
 
 import asyncio
+import json as json_mod
+import sys
 import click
 from rich.console import Console
 from rich.table import Table
@@ -11,15 +17,31 @@ from .config import (
     load_last_search,
     save_last_search,
     get_download_dir,
+    CONFIG_FILE,
 )
 from .client import ZlibClient
 
-console = Console()
+console = Console(stderr=True)
+stdout_console = Console()
 
 
 def run(coro):
     """Run an async coroutine synchronously."""
     return asyncio.run(coro)
+
+
+def json_out(data):
+    """Write JSON to stdout and exit."""
+    click.echo(json_mod.dumps(data, ensure_ascii=False, indent=2))
+
+
+def error_out(msg: str, as_json: bool = False):
+    """Print error. JSON mode writes to stdout; human mode writes to stderr."""
+    if as_json:
+        json_out({"error": str(msg)})
+        sys.exit(1)
+    else:
+        console.print(f"[red]{msg}[/red]")
 
 
 def format_size(b: int) -> str:
@@ -52,12 +74,55 @@ def get_authors(book: dict) -> str:
     return str(authors) if authors else ""
 
 
+def book_to_dict(book: dict, index: int | None = None) -> dict:
+    """Normalize a book object to a flat dict for JSON output."""
+    url = book.get("url", "")
+    d = {
+        "id": extract_book_id(url),
+        "name": book.get("name", ""),
+        "authors": get_authors(book),
+        "year": book.get("year", ""),
+        "extension": book.get("extension", ""),
+        "size": book.get("size", ""),
+        "language": book.get("language", ""),
+        "url": url,
+    }
+    if index is not None:
+        d["index"] = index
+    for extra in ("publisher", "isbn", "rating", "description", "download_url"):
+        val = book.get(extra)
+        if val:
+            d[extra] = val
+    return d
+
+
 # ── CLI group ──────────────────────────────────────────────────────
 
 
 @click.group()
 def cli():
-    """zl - Z-Library CLI: search and download ebooks."""
+    """Search and download ebooks from Z-Library.
+
+    \b
+    Workflow:
+      1. zl login                  # one-time setup
+      2. zl search "query"         # find books
+      3. zl download <#>           # download by result index
+
+    \b
+    Agent integration:
+      Pass --json to any command for structured JSON output on stdout.
+      All human-readable messages go to stderr, so stdout is always clean JSON.
+
+    \b
+    Proxy:
+      Auto-detects all_proxy/https_proxy/http_proxy from environment.
+      Or set persistently: zl config proxy socks5://127.0.0.1:7890
+
+    \b
+    Config: ~/.config/zlib-cli/config.json
+    Downloads: ~/Downloads/zlib/ (override with: zl config download_dir PATH)
+    """
     pass
 
 
@@ -65,31 +130,44 @@ def cli():
 
 
 @cli.command()
-@click.option("--email", prompt="Email", help="Z-Library / SingleLogin email")
+@click.option("--email", prompt="Email", help="Z-Library / SingleLogin email.")
 @click.option(
-    "--password", prompt="Password", hide_input=True, help="Z-Library password"
+    "--password", prompt="Password", hide_input=True, help="Z-Library password."
 )
-def login(email, password):
-    """Save login credentials (verified on server)."""
+@click.option("--json", "as_json", is_flag=True, help="Output result as JSON.")
+def login(email, password, as_json):
+    """Authenticate and save credentials.
+
+    Verifies credentials against Z-Library server, then saves to local config.
+    Credentials are stored in ~/.config/zlib-cli/config.json (chmod 600).
+
+    \b
+    JSON output: {"ok": true} or {"error": "..."}
+    """
 
     async def _verify():
         client = ZlibClient()
         if client.proxy_list:
-            console.print(f"[dim]使用代理: {client.proxy_list[0]}[/dim]")
+            console.print(f"[dim]Using proxy: {client.proxy_list[0]}[/dim]")
         await client.login(email, password)
 
     try:
         run(_verify())
     except Exception as e:
-        console.print(f"[red]登录失败: {e}[/red]")
-        console.print("[dim]提示: 如果网络超时，尝试设置代理: zl config proxy socks5://127.0.0.1:7890[/dim]")
+        error_out(f"Login failed: {e}", as_json)
+        if not as_json:
+            console.print("[dim]Tip: zl config proxy socks5://127.0.0.1:7890[/dim]")
         return
 
     config = load_config()
     config["email"] = email
     config["password"] = password
     save_config(config)
-    console.print("[green]✓ 登录成功，凭据已保存。[/green]")
+
+    if as_json:
+        json_out({"ok": True})
+    else:
+        console.print("[green]✓ Login successful, credentials saved.[/green]")
 
 
 # ── search ─────────────────────────────────────────────────────────
@@ -97,14 +175,29 @@ def login(email, password):
 
 @cli.command()
 @click.argument("query")
-@click.option("-l", "--lang", help="语言 (english / chinese / ...)")
-@click.option("-e", "--ext", help="格式 (pdf / epub / mobi / ...)")
-@click.option("--year-from", type=int, help="起始年份")
-@click.option("--year-to", type=int, help="截止年份")
-@click.option("-n", "--count", default=10, show_default=True, help="每页结果数")
-@click.option("--exact", is_flag=True, help="精确匹配")
-def search(query, lang, ext, year_from, year_to, count, exact):
-    """Search for books. Example: zl search "clean code" -e pdf"""
+@click.option("-l", "--lang", help="Language filter. Values: english, chinese, russian, etc.")
+@click.option("-e", "--ext", help="File format filter. Values: pdf, epub, mobi, djvu, fb2, azw3, txt.")
+@click.option("--year-from", type=int, help="Minimum publication year (inclusive).")
+@click.option("--year-to", type=int, help="Maximum publication year (inclusive).")
+@click.option("-n", "--count", default=10, show_default=True, help="Number of results to return.")
+@click.option("--exact", is_flag=True, help="Exact title match only.")
+@click.option("--json", "as_json", is_flag=True, help="Output results as JSON array.")
+def search(query, lang, ext, year_from, year_to, count, exact, as_json):
+    """Search for books by title, author, or ISBN.
+
+    \b
+    Examples:
+      zl search "clean code" -e pdf
+      zl search "机器学习" -l chinese -n 20
+      zl search "978-0-13-468599-1"             # search by ISBN
+
+    Results are cached locally. Use the index number (#) with
+    'zl download', 'zl info' to reference results.
+
+    \b
+    JSON output: array of objects with fields:
+      index, id, name, authors, year, extension, size, language, url
+    """
 
     async def _search():
         client = ZlibClient()
@@ -123,44 +216,52 @@ def search(query, lang, ext, year_from, year_to, count, exact):
     try:
         results = run(_search())
     except Exception as e:
-        console.print(f"[red]搜索失败: {e}[/red]")
+        error_out(f"Search failed: {e}", as_json)
         return
 
     if not results:
-        console.print("[yellow]未找到结果。[/yellow]")
+        if as_json:
+            json_out([])
+        else:
+            console.print("[yellow]No results found.[/yellow]")
         return
 
-    table = Table(title=f"搜索: {query}", show_lines=False, padding=(0, 1))
-    table.add_column("#", style="cyan", width=3, justify="right")
-    table.add_column("标题", style="bold", max_width=45, overflow="ellipsis")
-    table.add_column("作者", max_width=22, overflow="ellipsis")
-    table.add_column("年份", width=4, justify="center")
-    table.add_column("格式", width=5, justify="center")
-    table.add_column("大小", width=8, justify="right")
-    table.add_column("ID", style="dim", max_width=18)
-
     cache = []
+    out_list = []
     for i, book in enumerate(results, 1):
-        url = book.get("url", "")
-        book_id = extract_book_id(url)
-        authors = get_authors(book)
-        name = book.get("name", "Unknown")
-
-        table.add_row(
-            str(i),
-            name,
-            authors,
-            str(book.get("year", "")),
-            book.get("extension", ""),
-            book.get("size", ""),
-            book_id,
-        )
-        cache.append({"id": book_id, "name": name, "ext": book.get("extension", "")})
+        d = book_to_dict(book, index=i)
+        out_list.append(d)
+        cache.append({"id": d["id"], "name": d["name"], "ext": d["extension"]})
 
     save_last_search(cache)
-    console.print(table)
+
+    if as_json:
+        json_out(out_list)
+        return
+
+    table = Table(title=f"Search: {query}", show_lines=False, padding=(0, 1))
+    table.add_column("#", style="cyan", width=3, justify="right")
+    table.add_column("Title", style="bold", max_width=45, overflow="ellipsis")
+    table.add_column("Author", max_width=22, overflow="ellipsis")
+    table.add_column("Year", width=4, justify="center")
+    table.add_column("Ext", width=5, justify="center")
+    table.add_column("Size", width=8, justify="right")
+    table.add_column("ID", style="dim", max_width=18)
+
+    for d in out_list:
+        table.add_row(
+            str(d["index"]),
+            d["name"],
+            d["authors"],
+            str(d["year"]),
+            d["extension"],
+            d["size"],
+            d["id"],
+        )
+
+    stdout_console.print(table)
     console.print(
-        "\n[dim]下载: [bold]zl download <#>[/bold]（序号）或 "
+        "\n[dim]Download: [bold]zl download <#>[/bold] or "
         "[bold]zl download <ID>[/bold][/dim]"
     )
 
@@ -170,22 +271,29 @@ def search(query, lang, ext, year_from, year_to, count, exact):
 
 @cli.command()
 @click.argument("ref")
-@click.option("-o", "--output", help="输出目录")
-def download(ref, output):
-    """Download a book by # (from last search) or by book ID."""
-    # Resolve ref → book_id
+@click.option("-o", "--output", help="Output directory. Default: ~/Downloads/zlib/")
+@click.option("--json", "as_json", is_flag=True, help="Output result as JSON.")
+def download(ref, output, as_json):
+    """Download a book to local disk.
+
+    REF can be:
+      - An index number from the last search (e.g. "3")
+      - A book ID from Z-Library (e.g. "5393918/a28f0c")
+
+    \b
+    JSON output: {"path": "/abs/path/to/file.pdf", "size": 4231680}
+    Error:       {"error": "..."}
+    """
     if ref.isdigit():
         idx = int(ref)
         cache = load_last_search()
         if not cache or idx < 1 or idx > len(cache):
-            console.print(
-                f"[red]序号 {idx} 无效（共 {len(cache)} 条结果）。"
-                "请先运行 zl search。[/red]"
-            )
+            error_out(f"Index {idx} out of range ({len(cache)} results). Run 'zl search' first.", as_json)
             return
         entry = cache[idx - 1]
         book_id = entry["id"]
-        console.print(f"[dim]#{idx} {entry['name']}[/dim]")
+        if not as_json:
+            console.print(f"[dim]#{idx} {entry['name']}[/dim]")
     else:
         book_id = ref
 
@@ -194,14 +302,16 @@ def download(ref, output):
         await client.login()
         return await client.download_book(book_id, output)
 
-    console.print("[dim]正在获取下载链接...[/dim]")
+    if not as_json:
+        console.print("[dim]Fetching download link...[/dim]")
     try:
         filepath, size = run(_download())
-        console.print(
-            f"[green]✓ 已保存: {filepath}  ({format_size(size)})[/green]"
-        )
+        if as_json:
+            json_out({"path": str(filepath), "size": size})
+        else:
+            console.print(f"[green]✓ Saved: {filepath}  ({format_size(size)})[/green]")
     except Exception as e:
-        console.print(f"[red]下载失败: {e}[/red]")
+        error_out(f"Download failed: {e}", as_json)
 
 
 # ── info ───────────────────────────────────────────────────────────
@@ -209,13 +319,23 @@ def download(ref, output):
 
 @cli.command()
 @click.argument("ref")
-def info(ref):
-    """Show detailed info for a book by # or ID."""
+@click.option("--json", "as_json", is_flag=True, help="Output book metadata as JSON.")
+def info(ref, as_json):
+    """Show detailed metadata for a book.
+
+    REF can be an index number from the last search or a book ID.
+    Fetches full metadata including description, ISBN, publisher, and download availability.
+
+    \b
+    JSON output: object with fields:
+      id, name, authors, year, publisher, language, extension, size,
+      isbn, rating, description, download_url
+    """
     if ref.isdigit():
         idx = int(ref)
         cache = load_last_search()
         if not cache or idx < 1 or idx > len(cache):
-            console.print("[red]序号无效。请先运行 zl search。[/red]")
+            error_out("Index out of range. Run 'zl search' first.", as_json)
             return
         book_id = cache[idx - 1]["id"]
     else:
@@ -229,42 +349,51 @@ def info(ref):
     try:
         book = run(_fetch())
     except Exception as e:
-        console.print(f"[red]获取失败: {e}[/red]")
+        error_out(f"Fetch failed: {e}", as_json)
+        return
+
+    if as_json:
+        json_out(book_to_dict(book))
         return
 
     fields = [
-        ("标题", book.get("name", "")),
-        ("作者", get_authors(book)),
-        ("年份", book.get("year", "")),
-        ("出版社", book.get("publisher", "")),
-        ("语言", book.get("language", "")),
-        ("格式", book.get("extension", "")),
-        ("大小", book.get("size", "")),
+        ("Title", book.get("name", "")),
+        ("Authors", get_authors(book)),
+        ("Year", book.get("year", "")),
+        ("Publisher", book.get("publisher", "")),
+        ("Language", book.get("language", "")),
+        ("Format", book.get("extension", "")),
+        ("Size", book.get("size", "")),
         ("ISBN", book.get("isbn", "")),
-        ("评分", book.get("rating", "")),
+        ("Rating", book.get("rating", "")),
     ]
 
     for label, val in fields:
         if val:
-            console.print(f"  [bold]{label}:[/bold] {val}")
+            stdout_console.print(f"  [bold]{label}:[/bold] {val}")
 
     desc = book.get("description", "")
     if desc:
-        console.print(f"\n  [dim]{desc[:300]}{'...' if len(desc) > 300 else ''}[/dim]")
+        stdout_console.print(f"\n  [dim]{desc[:300]}{'...' if len(desc) > 300 else ''}[/dim]")
 
     dl = book.get("download_url", "")
     if dl and "Unavailable" not in str(dl):
-        console.print(f"\n  [green]可下载[/green] — [dim]zl download {book_id}[/dim]")
+        console.print(f"\n  [green]Available[/green] — [dim]zl download {book_id}[/dim]")
     else:
-        console.print("\n  [yellow]下载不可用（可能需要 Tor/代理）[/yellow]")
+        console.print("\n  [yellow]Download unavailable (may require Tor/proxy)[/yellow]")
 
 
 # ── limits ─────────────────────────────────────────────────────────
 
 
 @cli.command()
-def limits():
-    """Show today's download limits."""
+@click.option("--json", "as_json", is_flag=True, help="Output limits as JSON.")
+def limits(as_json):
+    """Show today's download quota and usage.
+
+    \b
+    JSON output: {"daily_allowed": 10, "daily_amount": 3, "daily_remaining": 7, "daily_reset": "..."}
+    """
 
     async def _limits():
         client = ZlibClient()
@@ -274,26 +403,35 @@ def limits():
     try:
         data = run(_limits())
     except Exception as e:
-        console.print(f"[red]获取失败: {e}[/red]")
+        error_out(f"Fetch failed: {e}", as_json)
+        return
+
+    if as_json:
+        json_out(data if isinstance(data, dict) else {"raw": str(data)})
         return
 
     if isinstance(data, dict):
-        console.print(f"  每日额度: {data.get('daily_allowed', '?')}")
-        console.print(f"  已使用:   {data.get('daily_amount', '?')}")
-        console.print(f"  剩余:     {data.get('daily_remaining', '?')}")
+        stdout_console.print(f"  Daily allowed:   {data.get('daily_allowed', '?')}")
+        stdout_console.print(f"  Used today:      {data.get('daily_amount', '?')}")
+        stdout_console.print(f"  Remaining:       {data.get('daily_remaining', '?')}")
         reset = data.get("daily_reset", "")
         if reset:
-            console.print(f"  重置时间: {reset}")
+            stdout_console.print(f"  Resets at:       {reset}")
     else:
-        console.print(f"  {data}")
+        stdout_console.print(f"  {data}")
 
 
 # ── history ────────────────────────────────────────────────────────
 
 
 @cli.command()
-def history():
-    """Show recent download history."""
+@click.option("--json", "as_json", is_flag=True, help="Output history as JSON array.")
+def history(as_json):
+    """Show recent download history from your Z-Library account.
+
+    \b
+    JSON output: array of objects with fields: name, extension, url
+    """
 
     async def _history():
         client = ZlibClient()
@@ -303,17 +441,24 @@ def history():
     try:
         results = run(_history())
     except Exception as e:
-        console.print(f"[red]获取失败: {e}[/red]")
+        error_out(f"Fetch failed: {e}", as_json)
         return
 
     if not results:
-        console.print("[yellow]暂无下载记录。[/yellow]")
+        if as_json:
+            json_out([])
+        else:
+            console.print("[yellow]No download history.[/yellow]")
         return
 
-    table = Table(title="下载历史")
+    if as_json:
+        json_out([book_to_dict(b, index=i) for i, b in enumerate(results, 1)])
+        return
+
+    table = Table(title="Download History")
     table.add_column("#", style="cyan", width=3, justify="right")
-    table.add_column("标题", style="bold", max_width=50, overflow="ellipsis")
-    table.add_column("格式", width=5, justify="center")
+    table.add_column("Title", style="bold", max_width=50, overflow="ellipsis")
+    table.add_column("Ext", width=5, justify="center")
 
     for i, book in enumerate(results, 1):
         table.add_row(
@@ -322,7 +467,7 @@ def history():
             book.get("extension", ""),
         )
 
-    console.print(table)
+    stdout_console.print(table)
 
 
 # ── config ─────────────────────────────────────────────────────────
@@ -331,32 +476,55 @@ def history():
 @cli.command("config")
 @click.argument("key", required=False)
 @click.argument("value", required=False)
-def config_cmd(key, value):
-    """Get/set config. Keys: download_dir, email. Example: zl config download_dir ~/Books"""
+@click.option("--json", "as_json", is_flag=True, help="Output config as JSON.")
+def config_cmd(key, value, as_json):
+    """View or set configuration.
+
+    \b
+    Config keys:
+      download_dir   Download directory (default: ~/Downloads/zlib)
+      proxy          Proxy URL (e.g. socks5://127.0.0.1:7890)
+      email          Z-Library login email
+      password       Z-Library password (masked in human output)
+
+    \b
+    Usage:
+      zl config                          # show all
+      zl config download_dir             # show one key
+      zl config download_dir ~/Books     # set a key
+      zl config --json                   # all config as JSON (password masked)
+    """
     cfg = load_config()
 
     if key is None:
-        # Show all (mask password)
-        for k, v in cfg.items():
-            display = "****" if k == "password" else v
-            console.print(f"  [bold]{k}:[/bold] {display}")
-        console.print(f"\n  [dim]配置文件: {__import__('zlib_cli.config', fromlist=['CONFIG_FILE']).CONFIG_FILE}[/dim]")
+        safe_cfg = {k: ("****" if k == "password" else v) for k, v in cfg.items()}
+        if as_json:
+            safe_cfg["_config_file"] = str(CONFIG_FILE)
+            json_out(safe_cfg)
+        else:
+            for k, v in safe_cfg.items():
+                stdout_console.print(f"  [bold]{k}:[/bold] {v}")
+            console.print(f"\n  [dim]Config file: {CONFIG_FILE}[/dim]")
         return
 
     if value is None:
-        # Get single key
         val = cfg.get(key)
         if val is None:
-            console.print(f"[yellow]未设置: {key}[/yellow]")
+            error_out(f"Key not set: {key}", as_json)
         else:
             display = "****" if key == "password" else val
-            console.print(f"  {key} = {display}")
+            if as_json:
+                json_out({key: display})
+            else:
+                stdout_console.print(f"  {key} = {display}")
         return
 
-    # Set
     cfg[key] = value
     save_config(cfg)
-    console.print(f"[green]✓ {key} = {value}[/green]")
+    if as_json:
+        json_out({"ok": True, key: value})
+    else:
+        stdout_console.print(f"[green]✓ {key} = {value}[/green]")
 
 
 # ── entry point ────────────────────────────────────────────────────
